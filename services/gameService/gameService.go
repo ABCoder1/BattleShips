@@ -23,6 +23,13 @@ var printMap = make(map[Cordinate]bool)
 
 var shipHitCount uint8 = 0
 
+func ResetGameState() {
+	printMap = make(map[Cordinate]bool)
+	shipHitCount = 0
+	ship.AllShips = make(map[int][]ship.Coordinates)
+	ship.ResetRenderedShips()
+}
+
 func NewGameService(name string, latitude, longitude uint8, numberOfShips int) (*player.Player, *board.Board) {
 	p1 := player.CreatePlayer(name)
 
