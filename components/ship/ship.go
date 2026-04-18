@@ -12,6 +12,17 @@ type Coordinates struct {
 	y uint8
 }
 
+type RenderCoordinate struct {
+	X uint8
+	Y uint8
+}
+
+type RenderedShip struct {
+	Size       int
+	IsVertical bool
+	Coords     []RenderCoordinate
+}
+
 type orientation uint8
 
 const (
@@ -22,83 +33,161 @@ const (
 // Map to store coordinates of each ship
 var AllShips = make(map[int][]Coordinates) // map[size][(),(),()...Coordinates]
 
+// NOTE : Persistent snapshot captured at generation time. This is not mutated when
+// ships are destroyed, so it can be used to render the full fleet layout on the post-game reveal screen.
+var renderedShipsSnapshot []RenderedShip
+
+// NOTE : Reusable scratch buffer for candidate positions. Reusing this across
+// placements avoids repeated heap allocations during ship generation, which
+// used to spike memory when many games were played back-to-back or when
+// generating large fleets.
+var candidateScratch []placement
+
+type placement struct {
+	x, y       uint8
+	isVertical bool
+}
+
+func ResetRenderedShips() {
+	// NOTE : Truncate rather than reassign so the underlying array can be reused by
+	// the next game, reducing allocations handed to the GC.
+	renderedShipsSnapshot = renderedShipsSnapshot[:0]
+}
+
+func SnapshotRenderedShips() []RenderedShip {
+	out := make([]RenderedShip, len(renderedShipsSnapshot))
+	for i, s := range renderedShipsSnapshot {
+		copied := make([]RenderCoordinate, len(s.Coords))
+		copy(copied, s.Coords)
+		out[i] = RenderedShip{
+			Size:       s.Size,
+			IsVertical: s.IsVertical,
+			Coords:     copied,
+		}
+	}
+	return out
+}
+
+func SnapshotAllShips() map[int][]RenderCoordinate {
+	out := make(map[int][]RenderCoordinate, len(AllShips))
+	for size, coords := range AllShips {
+		copied := make([]RenderCoordinate, len(coords))
+		for i, c := range coords {
+			copied[i] = RenderCoordinate{X: c.x, Y: c.y}
+		}
+		out[size] = copied
+	}
+	return out
+}
+
+// NOTE : GenerateRandomShips places `numberOfShips` ships (sizes 1..numberOfShips) on
+// the supplied board. The placement algorithm enumerates all legal positions
+// for each ship size then picks one uniformly at random. This is bounded
+// (O(width*height*size) per ship) and always terminates, which is critical
+// because earlier versions could spin indefinitely for infeasible configurations
+// (e.g. many large ships on a small grid), leading to unbounded memory growth
+// from stalled frames and never-freed allocations.
 func GenerateRandomShips(numberOfShips int, b *board.Board) {
+	renderedShipsSnapshot = renderedShipsSnapshot[:0]
+	for k := range AllShips {
+		delete(AllShips, k)
+	}
+
+	if b == nil || numberOfShips <= 0 {
+		return
+	}
+
 	for size := 1; size <= numberOfShips; size++ {
-		orient := orientation(rand.Intn(2))
-		AllShips[size] = createShipInstance(int(orient), uint8(size), b)
+		coords, isVertical, ok := tryPlaceShip(uint8(size), b)
+		if !ok {
+			// NOTE : Infeasible layout for the remaining ships. Abort rather than
+			// spin forever; upstream code still renders whatever has been placed so far.
+			fmt.Printf("ship.GenerateRandomShips: no legal placement for size %d on %dx%d board\n", size, b.GetBoardWidth(), b.GetBoardHeight())
+			return
+		}
+
+		AllShips[size] = coords
+
+		rendered := make([]RenderCoordinate, len(coords))
+		for i, c := range coords {
+			rendered[i] = RenderCoordinate{X: c.x, Y: c.y}
+		}
+		renderedShipsSnapshot = append(renderedShipsSnapshot, RenderedShip{
+			Size:       size,
+			IsVertical: isVertical,
+			Coords:     rendered,
+		})
 	}
 }
 
-func createShipInstance(orient int, size uint8, b *board.Board) []Coordinates {
-	var i int
-	var xCoordinate, yCoordinate int
-	ship := make([]Coordinates, size)
+// NOTE : tryPlaceShip enumerates every legal position (both orientations) for a ship
+// of the given size on the current board, then chooses one uniformly at random.
+// Returns the placed coordinates, its orientation, and true on success.
+func tryPlaceShip(size uint8, b *board.Board) ([]Coordinates, bool, bool) {
+	width := b.GetBoardWidth()
+	height := b.GetBoardHeight()
+	grid := *b.PtrToBoard
 
-	switch orient {
-	case 0: // Horizontally placed ship
-		for {
-			xCoordinate, yCoordinate = getRandomCoordinates()
-			if (xCoordinate+int(size)) < int(b.GetBoardWidth()) && (yCoordinate < int(b.GetBoardHeight())) { // Checking if ship's indices go out of bounds
-				noCollisions := true
-				for i = range int(size) {
-					if (*b.PtrToBoard)[yCoordinate][xCoordinate+i] == board.Ship { // Checking if any indices of our chosen slice is already occupied by another ship.
-						noCollisions = false
-						break
-					}
-				}
+	candidateScratch = candidateScratch[:0]
 
-				if noCollisions {
-					break
+	if size <= width {
+		limitX := width - size
+		for y := uint8(0); y < height; y++ {
+			for x := uint8(0); x <= limitX; x++ {
+				if !segmentFree(grid, x, y, size, false) {
+					continue
 				}
+				candidateScratch = append(candidateScratch, placement{x: x, y: y, isVertical: false})
 			}
 		}
-
-		for i = range int(size) {
-			(*b.PtrToBoard)[yCoordinate][xCoordinate+i] = board.Ship
-
-			ship[i] = Coordinates{
-				x: uint8(xCoordinate + i),
-				y: uint8(yCoordinate),
-			}
-		}
-
-	case 1: // Vertically placed ship
-		for {
-			xCoordinate, yCoordinate = getRandomCoordinates()
-			if (yCoordinate+int(size)) < int(b.GetBoardHeight()) && (xCoordinate < int(b.GetBoardWidth())) { // Checking if ship's indices go out of bounds
-				noCollisions := true
-				for i := range int(size) {
-					if (*b.PtrToBoard)[yCoordinate+i][xCoordinate] == board.Ship { // Checking if any indices of our chosen slice is already occupied by another ship.
-						noCollisions = false
-						break
-					}
-				}
-
-				if noCollisions {
-					break
-				}
-			}
-		}
-
-		for i = range int(size) {
-			(*b.PtrToBoard)[yCoordinate+i][xCoordinate] = board.Ship
-
-			ship[i] = Coordinates{
-				x: uint8(xCoordinate),
-				y: uint8(yCoordinate + i),
-			}
-		}
-
 	}
 
-	return ship
+	if size <= height {
+		limitY := height - size
+		for x := uint8(0); x < width; x++ {
+			for y := uint8(0); y <= limitY; y++ {
+				if !segmentFree(grid, x, y, size, true) {
+					continue
+				}
+				candidateScratch = append(candidateScratch, placement{x: x, y: y, isVertical: true})
+			}
+		}
+	}
+
+	if len(candidateScratch) == 0 {
+		return nil, false, false
+	}
+
+	chosen := candidateScratch[rand.Intn(len(candidateScratch))]
+	coords := make([]Coordinates, size)
+	if chosen.isVertical {
+		for i := uint8(0); i < size; i++ {
+			grid[chosen.y+i][chosen.x] = board.Ship
+			coords[i] = Coordinates{x: chosen.x, y: chosen.y + i}
+		}
+	} else {
+		for i := uint8(0); i < size; i++ {
+			grid[chosen.y][chosen.x+i] = board.Ship
+			coords[i] = Coordinates{x: chosen.x + i, y: chosen.y}
+		}
+	}
+
+	return coords, chosen.isVertical, true
 }
 
-func getRandomCoordinates() (int, int) {
-	x := rand.Intn(256)
-	y := rand.Intn(256)
-
-	return x, y
+func segmentFree(grid [][]board.Status, x, y, size uint8, vertical bool) bool {
+	for i := uint8(0); i < size; i++ {
+		if vertical {
+			if grid[y+i][x] == board.Ship {
+				return false
+			}
+		} else {
+			if grid[y][x+i] == board.Ship {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func IsAnyShipDestroyed(b *board.Board) {
